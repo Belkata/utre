@@ -33,6 +33,7 @@ The UI style is decided: **Soft** (rounded cards, teal placeholder accent, Manro
 ## Latest session (2026-11-26, Arch laptop, orchestrated multi-agent run; released as v0.8.0 to v0.8.7)
 
 Parallel agents in worktrees, each change a PR with green CI (PRs 19 to 44, all merged; nothing open).
+- **v0.8.13 (2026-11-28):** fresh Android installs can start sync again (PR 72: SELinux denies hard links, the device key now falls back to renameat2/rename; plan/16). Every fresh install from v0.8.0 to v0.8.12 was stuck at 'Starting sync'.
 - **v0.8.12 (2026-11-28):** the first APK signed with the release key (cert SHA-256 60:98:6D:…:F5:C3, `packaging/android/release-cert.sha256`, enforced by `scripts/build-apk.sh`); phones on older debug-signed builds need one uninstall and reinstall (sync first, then pair again and sign in to Google). Also CI path filters, release-build caching, the u-tick logo on the README and website. `main` requires PRs.
 - **CI:** hardened, with blocking rustfmt, clippy and shellcheck, 26 Linux golden tests (`app/test/golden/`), and a non-required Linux integration job under xvfb.
 - **UI:** a date and time picker (dialog on desktop, bottom sheet on the phone), Rust, Android and Flutter review fixes, `start_at` and the keyboard focus ring, the new **u-tick icon** and tray icon (PR 33; plan/20 round 8 and 9), and calendar bugs the goldens found (PR 34: all-day in Day/Month, "+N", compact tiles, "1 days ago", sheet tint).
@@ -222,6 +223,7 @@ The first Gradle build takes about 6 minutes, because cargokit compiles Rust for
 - After editing a podspec, run `pod install` in `app/macos`; `flutter build macos` doesn't notice. CocoaPods needs a UTF-8 locale (`scripts/env.sh` sets it).
 - The macOS app has **no App Sandbox**: in it the app couldn't reach the daemon's socket or the shared DB.
 - **New core calls go in the `api!` table in `api/src/proto.rs`.** That makes them reachable over the socket and as an `Api` method. Bridge view types are flutter_rust_bridge mirrors of `utre-api` types: change both together, then regenerate.
+- **Android apps can't make hard links** (SELinux `avc: denied { link }` for untrusted_app): don't use `std::fs::hard_link` in code that runs on the phone (sync/src/lib.rs `publish_chain` has the fallback).
 - **Never let a Rust backtrace be captured in the app process.** It segfaults: libflutter_linux_gtk.so bundles libunwind and clashes with libgcc_s. `init_app` sets `RUST_BACKTRACE=0` for that reason, so don't remove it, and don't run the app with `RUST_BACKTRACE=1`.
 - **The Linux app prefers XWayland** (`app/linux/runner/main.cc`): Flutter's GTK3 embedder makes typing laggy on native Wayland and it is smooth under X11. `GDK_BACKEND` set explicitly wins; `UTRE_WAYLAND=1` forces native Wayland. The X11 WM_CLASS is lowercase `dev.utre.utre` (`gdk_set_program_class`).
 - **The app's process name is `utre` for both the checkout bundle and the packaged `/usr/lib/utre/utre`**, so never kill by name (match `/proc/<pid>/exe`, or `kill <pid>`). After `pacman -Syu` the packaged daemon and app keep running the old version until `systemctl --user restart utre.service` and reopening the app.
