@@ -480,7 +480,89 @@ fn rand_suffix() -> u64 {
 
 /// Give `tmp`'s contents the name `to`, failing with `AlreadyExists` if `to` exists.
 fn publish_new(tmp: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::hard_link(tmp, to)
+    publish_chain(tmp, to, |a, b| std::fs::hard_link(a, b), rename_noreplace)
+}
+
+/// Errors that mean "this mechanism is not allowed or not supported here", as opposed to a
+/// real answer such as `AlreadyExists`.
+fn is_unsupported(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::AlreadyExists {
+        return false;
+    }
+    #[cfg(unix)]
+    if let Some(code) = e.raw_os_error() {
+        return matches!(
+            code,
+            libc::EACCES | libc::EPERM | libc::ENOTSUP | libc::EINVAL | libc::ENOSYS
+        ) || code == libc::EOPNOTSUPP;
+    }
+    e.kind() == std::io::ErrorKind::PermissionDenied || e.kind() == std::io::ErrorKind::Unsupported
+}
+
+/// The fallback chain behind `publish_new`, with the two syscalls injectable for tests.
+///
+/// 1. `link` (a hard link): atomic and never clobbers. Used on Linux and macOS.
+/// 2. Android's SELinux policy denies `link` to untrusted apps (`avc: denied { link }`,
+///    surfacing as EACCES), so fall back to `rename_noreplace` (renameat2 with
+///    RENAME_NOREPLACE): equally atomic and no-clobber.
+/// 3. Old kernels or filesystems may not offer that either (EINVAL/ENOSYS/EPERM/EACCES), so
+///    last, check that `to` is absent and plain `rename`. The only race is two processes
+///    creating the very first key at the same instant; on Android all writers share one
+///    process and one sync node.
+fn publish_chain(
+    tmp: &Path,
+    to: &Path,
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+    noreplace: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match link(tmp, to) {
+        Err(e) if is_unsupported(&e) => {}
+        other => return other,
+    }
+    match noreplace(tmp, to) {
+        Err(e) if is_unsupported(&e) => {}
+        other => return other,
+    }
+    if to.symlink_metadata().is_ok() {
+        return Err(std::io::ErrorKind::AlreadyExists.into());
+    }
+    std::fs::rename(tmp, to)
+}
+
+/// Atomic rename that fails with `AlreadyExists` instead of replacing `to`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let cstr = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+    };
+    let (f, t) = (cstr(from)?, cstr(to)?);
+    const RENAME_NOREPLACE: libc::c_uint = 1;
+    // The raw syscall, because bionic only wraps renameat2 from API 30.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            f.as_ptr(),
+            libc::AT_FDCWD,
+            t.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if r == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::EEXIST) {
+        return Err(std::io::ErrorKind::AlreadyExists.into());
+    }
+    Err(e)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn rename_noreplace(_: &Path, _: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 #[cfg(unix)]
@@ -564,6 +646,80 @@ mod tests {
         }
         let leftovers = std::fs::read_dir(&dir).unwrap().count();
         assert_eq!(leftovers, 30, "no temp files left behind");
+    }
+
+    fn eacces() -> std::io::Error {
+        std::io::Error::from_raw_os_error(libc::EACCES)
+    }
+    fn no_link(_: &Path, _: &Path) -> std::io::Result<()> {
+        Err(eacces())
+    }
+    fn no_noreplace(_: &Path, _: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+    fn staged(name: &str) -> (PathBuf, PathBuf) {
+        let dir = temp_dir(name);
+        let tmp = dir.join("k-tmp");
+        write_private(&tmp, &[7u8; 32]).unwrap();
+        (tmp, dir.join("k"))
+    }
+    fn check_published(to: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::read(to).unwrap(), [7u8; 32]);
+        assert_eq!(
+            std::fs::metadata(to).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn publish_hard_link_first() {
+        let (tmp, to) = staged("pub-link");
+        let no = |_: &Path, _: &Path| -> std::io::Result<()> { panic!("not reached") };
+        publish_chain(&tmp, &to, |a, b| std::fs::hard_link(a, b), no).unwrap();
+        check_published(&to);
+    }
+
+    #[test]
+    fn publish_link_denied_uses_renameat2() {
+        let (tmp, to) = staged("pub-r2");
+        publish_chain(&tmp, &to, no_link, rename_noreplace).unwrap();
+        check_published(&to);
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn publish_last_fallback_plain_rename() {
+        let (tmp, to) = staged("pub-last");
+        publish_chain(&tmp, &to, no_link, no_noreplace).unwrap();
+        check_published(&to);
+    }
+
+    #[test]
+    fn publish_existing_target_is_already_exists_everywhere() {
+        let kind = std::io::ErrorKind::AlreadyExists;
+        let (tmp, to) = staged("pub-exists");
+        std::fs::write(&to, b"other").unwrap();
+        let hl = |a: &Path, b: &Path| std::fs::hard_link(a, b);
+        assert_eq!(
+            publish_chain(&tmp, &to, hl, rename_noreplace)
+                .unwrap_err()
+                .kind(),
+            kind
+        );
+        assert_eq!(
+            publish_chain(&tmp, &to, no_link, rename_noreplace)
+                .unwrap_err()
+                .kind(),
+            kind
+        );
+        assert_eq!(
+            publish_chain(&tmp, &to, no_link, no_noreplace)
+                .unwrap_err()
+                .kind(),
+            kind
+        );
+        assert_eq!(std::fs::read(&to).unwrap(), b"other");
     }
 
     #[test]
