@@ -79,3 +79,9 @@ Back to [[00 Overview]] · [[10 Roadmap]] · [[05 P2P Sync]].
 - It was a **test bug**, not a convergence bug. In a ring (0-1, 1-2, 2-3, 3-0) plus compaction, one replica can be left holding a superseded op that nobody else has (the others dropped it before it reached them). Its version vector then differs, while the state is identical.
 - The test now asserts identical state on every replica after the ring. Log-level checks (version vectors equal, nothing owed) run after one all-pairs pass in compacted runs. The failing case is committed as `a_superseded_op_can_be_stranded_by_compaction_in_a_ring`; 50 consecutive runs passed.
 - CI prints the minimal failing input, since proptest can't persist regressions there.
+
+## Device key on Android (2026-11-28, v0.8.13, PR 72)
+- **Bug:** a fresh Android install couldn't start sync (v0.8.0 to v0.8.12). Creating the device key `utre.key` failed with "Permission denied", so the Devices page stayed at "Starting sync".
+- **Cause:** SELinux forbids `link` for `untrusted_app` on `app_data_file` (`avc: denied { link }`), and the key was published with a hard link (introduced by 59139c4 on 2026-11-26).
+- **Fix:** the key is published with a hard link, falling back to `renameat2(RENAME_NOREPLACE)`, then a checked rename (`publish_chain` in `sync/src/lib.rs`).
+- Only fresh installs were hit; existing installs already had a key. Verified on the real phone with a test build: no denial, the sync node starts. After a reinstall the identity is new, so the phone must be paired again.
